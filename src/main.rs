@@ -50,7 +50,7 @@ use crate::{
     db::Db, lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient, monitor::monitor_task,
 };
 use serde::Deserialize;
-use zcash_client_backend::keys::UnifiedFullViewingKey;
+use zcash_keys::keys::UnifiedFullViewingKey;
 
 #[derive(Deserialize, Debug)]
 pub struct WalletConfig {

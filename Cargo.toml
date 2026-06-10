@@ -35,15 +35,15 @@ sqlx = {version = "0.8.6", features = ["sqlite", "runtime-tokio"]}
 
 # Crypto
 tiny-bip39 = "0.8"
-bls12_381 = "^0.4.0"
-jubjub = "^0.6"
-ff = "^0.9"
-group = "0.9.0"
-orchard = "0.11.0"
+bls12_381 = "0.8"
+jubjub = "0.10"
+ff = "0.13"
+group = "0.13"
+orchard = "0.14"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
-sapling-crypto = "0.5.0"
+sapling-crypto = "0.7"
 zcash_note_encryption = "0.4.1"
 zip32 = "0.2"
 
@@ -52,32 +52,25 @@ tonic-build = "0.4.2"
 
 [dependencies.zcash_keys]
 git = "https://github.com/zcash/librustzcash.git"
-version = "0.12.0"
+version = "0.14.0"
+rev = "8766e0532a793516c27ad2f838bccfbb24d47285"
 features = ["sapling", "orchard"]
-
-[dependencies.zcash_client_backend]
-git = "https://github.com/zcash/librustzcash.git"
-version = "0.21.0"
-#rev = "1518b145f8ee67e144fa8337c7dfd4c8cff899c9"
 
 [dependencies.zcash_protocol]
 git = "https://github.com/zcash/librustzcash.git"
-version = "0.7"
+version = "0.9.0"
+rev = "8766e0532a793516c27ad2f838bccfbb24d47285"
 features = ["local-consensus"]
 
 [dependencies.zcash_address]
 git = "https://github.com/zcash/librustzcash.git"
-version = "0.10"
+version = "0.12.0"
+rev = "8766e0532a793516c27ad2f838bccfbb24d47285"
 
 [dependencies.zcash_primitives]
 git = "https://github.com/zcash/librustzcash.git"
-version = "0.26"
-#rev = "1518b145f8ee67e144fa8337c7dfd4c8cff899c9"
-
-[dependencies.zcash_proofs]
-git = "https://github.com/zcash/librustzcash.git"
-version = "0.26"
-#rev = "1518b145f8ee67e144fa8337c7dfd4c8cff899c9"
+version = "0.28.0"
+rev = "8766e0532a793516c27ad2f838bccfbb24d47285"
 
 [patch.crates-io]
 # orchard = { git = "https://github.com/zcash/orchard.git", rev = "cd3e0901ccac2c630dd7fd03eb496d5030c1bbfe" }

@@ -37,4 +37,21 @@ pub const REGTEST: LocalNetwork = LocalNetwork {
     nu5: Some(BlockHeight::from_u32(1)),
     nu6: Some(BlockHeight::from_u32(1)),
     nu6_1: Some(BlockHeight::from_u32(1)),
+    nu6_2: Some(BlockHeight::from_u32(1)),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::Network;
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    #[test]
+    fn mainnet_uses_nu6_2_branch_at_activation_height() {
+        let before = BranchId::for_height(&Network::Main, BlockHeight::from_u32(3_364_599));
+        let at_activation = BranchId::for_height(&Network::Main, BlockHeight::from_u32(3_364_600));
+
+        assert_eq!(before, BranchId::Nu6_1);
+        assert_eq!(at_activation, BranchId::Nu6_2);
+        assert_eq!(u32::from(at_activation), 0x5437_f330);
+    }
+}
