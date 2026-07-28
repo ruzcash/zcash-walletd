@@ -1,4 +1,4 @@
-`zcash-walletd` is a shielded only (sapling, orchard, UA) REST wallet
+`zcash-walletd` is a shielded only (sapling, orchard, ironwood, UA) REST wallet
 for zcash.
 
 Primary intended to work with the BTCPayServer payment gateway,
@@ -58,3 +58,29 @@ The latest image is available on DockerHub under `hhanh00/zcash-walletd:latest`
 ## Orchard
 Support for Orchard and UA was added in 1.1.2. You MUST delete the database file
 because the previous schema is not compatible.
+
+## NU6.3 (Ironwood)
+
+NU6.3 introduces the **Ironwood** shielded pool. Ironwood reuses Orchard's keys, addresses and
+action encoding, so **no new address type and no re-issuing of addresses is needed**: an
+Ironwood note is received at an ordinary Orchard receiver of a UA. What differs is that
+Ironwood notes use their own note-plaintext version and live in their own commitment tree, and
+that **once NU6.3 activates, payments to an Orchard receiver are routed to the Ironwood pool**.
+A wallet that scans only the Orchard bundle therefore stops seeing its own incoming payments
+after activation.
+
+`zcash-walletd` scans both pools. Two things are required of the deployment:
+
+- **Upgrade `lightwalletd`.** Ironwood data only rides in compact blocks when the client asks
+  for it via `BlockRange.poolTypes`, which is part of the versioned
+  [lightwallet-protocol](https://github.com/zcash/lightwallet-protocol). `zcash-walletd`
+  requests it only from a server that advertises `LightdInfo.lightwalletProtocolVersion`, since
+  a legacy server may reject or misinterpret the field. Against a legacy (<= v0.4.x) server it
+  falls back to the Sapling + Orchard default and logs a warning — correct before activation,
+  but Ironwood receives will be **invisible** after it. Upgrade the server before the NU6.3
+  activation height.
+- **No database reset is needed.** The `received_notes` table gains a `pool` column on first
+  start (note positions are only unique within a pool's own commitment tree, and Ironwood's
+  restarts at zero); the migration runs automatically and preserves existing rows.
+
+Activation is consensus-height driven — there is no build flag and no configuration switch.

@@ -40,6 +40,11 @@ message CompactTx {
     repeated CompactSaplingSpend spends = 4;   // inputs
     repeated CompactSaplingOutput outputs = 5; // outputs
     repeated CompactOrchardAction actions = 6;
+    // Actions of the Ironwood (NU6.3) bundle. Ironwood reuses Orchard's action encoding and
+    // keys, but its notes live in a *separate* commitment tree and use the V3 note-plaintext
+    // lead byte, so they must be trial-decrypted with the Ironwood note-encryption domain and
+    // positioned against the Ironwood tree. Only populated by versioned-protocol servers.
+    repeated CompactOrchardAction ironwoodActions = 9;
 }
 
 // CompactSaplingSpend is a Sapling Spend Description as described in 7.3 of the Zcash

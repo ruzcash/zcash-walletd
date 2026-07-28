@@ -15,12 +15,28 @@ message BlockID {
      bytes hash = 2;
 }
 
+// An identifier for a Zcash value pool.
+enum PoolType {
+    POOL_TYPE_INVALID = 0;
+    TRANSPARENT = 1;
+    SAPLING = 2;
+    ORCHARD = 3;
+    IRONWOOD = 4;
+}
+
 // BlockRange specifies a series of blocks from start to end inclusive.
 // Both BlockIDs must be heights; specification by hash is not yet supported.
+//
+// `poolTypes` selects which value pools the server should include in the returned
+// compact blocks. It is part of the *versioned* lightwallet-protocol
+// (https://github.com/zcash/lightwallet-protocol): a client MUST verify that the server
+// advertises a non-empty `LightdInfo.lightwalletProtocolVersion` before setting it, because
+// a legacy server may reject it or silently misinterpret tag 3. Leave it empty for the
+// legacy default (Sapling + Orchard only).
 message BlockRange {
     BlockID start = 1;
     BlockID end = 2;
-    uint64 spamFilterThreshold = 3;
+    repeated PoolType poolTypes = 3;
 }
 
 // A TxFilter contains the information needed to identify a particular
@@ -71,6 +87,13 @@ message LightdInfo {
     uint64 estimatedHeight = 12;        // less than tip height if zcashd is syncing
     string zcashdBuild = 13;            // example: "v4.1.1-877212414"
     string zcashdSubversion = 14;       // example: "/MagicBean:4.1.1/"
+    string donationAddress = 15;        // Zcash donation UA address
+    string upgradeName = 16;            // name of next pending network upgrade, empty if none scheduled
+    uint64 upgradeHeight = 17;          // height of next pending upgrade, zero if none is scheduled
+    // Version of https://github.com/zcash/lightwallet-protocol served by this server.
+    // Empty on legacy (<= v0.4.x) servers; a non-empty value is what gates `BlockRange.poolTypes`
+    // (and hence Ironwood data in compact blocks).
+    string lightwalletProtocolVersion = 18;
 }
 
 // TransparentAddressBlockFilter restricts the results to the given address
@@ -117,6 +140,7 @@ message TreeState {
     uint32 time = 4;        // Unix epoch time when the block was mined
     string saplingTree = 5; // sapling commitment tree state
     string orchardTree = 6; // orchard commitment tree state
+    string ironwoodTree = 7; // ironwood (NU6.3) commitment tree state
 }
 
 // Results are sorted by height, which makes it easy to issue another

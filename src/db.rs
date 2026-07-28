@@ -1,7 +1,7 @@
 use crate::account::{Account, AccountBalance, SubAccount};
 use crate::lwd_rpc::BlockId;
 use crate::network::Network;
-use crate::scan::ScanEvent;
+use crate::scan::{ScanEvent, POOL_ORCHARD, POOL_SAPLING};
 use crate::transaction::{SubAddress, Transfer};
 use crate::{notify_tx, Client, Hash};
 use anyhow::Result;
@@ -14,6 +14,26 @@ use zcash_keys::address::UnifiedAddress;
 use zcash_keys::encoding::AddressCodec;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+/// Schema of `received_notes`. Kept in one place because the pool migration rebuilds the table
+/// from it (SQLite cannot alter a table constraint in place).
+const RECEIVED_NOTES_DDL: &str = "CREATE TABLE IF NOT EXISTS received_notes (
+    id_note INTEGER PRIMARY KEY,
+    address TEXT NOT NULL,
+    account INTEGER,
+    sub_account INTEGER,
+    id_tx INTEGER NOT NULL,
+    pool INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    diversifier BLOB NOT NULL,
+    value INTEGER NOT NULL,
+    rcm BLOB NOT NULL,
+    nf BLOB NOT NULL UNIQUE,
+    rho BLOB,
+    memo TEXT,
+    spent INTEGER,
+    CONSTRAINT tx_output UNIQUE (pool, position))";
 
 pub struct Db {
     network: Network,
@@ -41,6 +61,57 @@ impl Db {
             notify_tx_url: notify_tx_url.to_string(),
             address_creation_lock: Mutex::new(()),
         })
+    }
+
+    /// Migrate a pre-NU6.3 `received_notes` table to the pool-aware schema.
+    ///
+    /// Note positions are only unique *within* a pool's commitment tree, and Ironwood's tree
+    /// starts from zero when NU6.3 activates — so its early positions collide head-on with the
+    /// low Sapling/Orchard positions a wallet may already hold, and the old
+    /// `UNIQUE (position)` constraint would reject the insert and wedge the scan. Record the
+    /// note's pool and key the constraint on `(pool, position)` instead.
+    ///
+    /// SQLite can't alter a table constraint in place, so rebuild the table. The pool of an
+    /// existing row is recoverable without rescanning: `rho` is only ever set for
+    /// Orchard-family notes, so a NULL `rho` means Sapling. No pre-migration row can be
+    /// Ironwood — the pool did not exist.
+    async fn migrate_received_notes_pool(connection: &mut SqliteConnection) -> Result<()> {
+        if sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'pool'")
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        log::info!("Migrating received_notes to the pool-aware (NU6.3) schema");
+
+        let mut db_transaction = connection.begin().await?;
+        let db_tx = db_transaction.acquire().await?;
+        sqlx::query(&RECEIVED_NOTES_DDL.replace("received_notes", "received_notes_new"))
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO received_notes_new
+            (id_note, address, account, sub_account, id_tx, pool, position, height,
+            diversifier, value, rcm, nf, rho, memo, spent)
+            SELECT id_note, address, account, sub_account, id_tx,
+            CASE WHEN rho IS NULL THEN ?1 ELSE ?2 END,
+            position, height, diversifier, value, rcm, nf, rho, memo, spent
+            FROM received_notes",
+        )
+        .bind(POOL_SAPLING)
+        .bind(POOL_ORCHARD)
+        .execute(&mut *db_tx)
+        .await?;
+        sqlx::query("DROP TABLE received_notes")
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query("ALTER TABLE received_notes_new RENAME TO received_notes")
+            .execute(&mut *db_tx)
+            .await?;
+        db_transaction.commit().await?;
+
+        Ok(())
     }
 
     async fn cleanup_stale_data(connection: &mut SqliteConnection) -> Result<()> {
@@ -433,26 +504,9 @@ impl Db {
         .execute(&mut *connection)
         .await?;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS received_notes (
-            id_note INTEGER PRIMARY KEY,
-            address TEXT NOT NULL,
-            account INTEGER,
-            sub_account INTEGER,
-            id_tx INTEGER NOT NULL,
-            position INTEGER NOT NULL,
-            height INTEGER NOT NULL,
-            diversifier BLOB NOT NULL,
-            value INTEGER NOT NULL,
-            rcm BLOB NOT NULL,
-            nf BLOB NOT NULL UNIQUE,
-            rho BLOB,
-            memo TEXT,
-            spent INTEGER,
-            CONSTRAINT tx_output UNIQUE (position))",
-        )
-        .execute(&mut *connection)
-        .await?;
+        sqlx::query(RECEIVED_NOTES_DDL)
+            .execute(&mut *connection)
+            .await?;
 
         Self::cleanup_stale_data(&mut connection).await?;
 
@@ -463,6 +517,8 @@ impl Db {
         {
             panic!("Old database schema. This version is not compatible with it.");
         }
+
+        Self::migrate_received_notes_pool(&mut connection).await?;
 
         let r = sqlx::query("SELECT 1 FROM addresses")
             .map(|r: SqliteRow| r.get::<u32, _>(0))
@@ -556,14 +612,15 @@ impl Db {
 
                     sqlx::query(
                         "INSERT INTO received_notes
-                        (address, account, sub_account, id_tx, position, height,
+                        (address, account, sub_account, id_tx, pool, position, height,
                         diversifier, value, rcm, nf, rho, memo, spent)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'',0)",
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'',0)",
                     )
                     .bind(&received_note.address)
                     .bind(account)
                     .bind(sub_account)
                     .bind(id_tx)
+                    .bind(received_note.pool)
                     .bind(received_note.position)
                     .bind(received_note.height)
                     .bind(received_note.diversifier.as_slice())
@@ -661,5 +718,118 @@ impl Db {
 
     pub fn ufvk(&self) -> &UnifiedFullViewingKey {
         &self.ufvk
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::POOL_IRONWOOD;
+    use sqlx::Connection;
+
+    /// The pre-NU6.3 `received_notes` schema: no `pool` column, and note positions constrained
+    /// to be unique across every pool.
+    const LEGACY_DDL: &str = "CREATE TABLE received_notes (
+        id_note INTEGER PRIMARY KEY,
+        address TEXT NOT NULL,
+        account INTEGER,
+        sub_account INTEGER,
+        id_tx INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        diversifier BLOB NOT NULL,
+        value INTEGER NOT NULL,
+        rcm BLOB NOT NULL,
+        nf BLOB NOT NULL UNIQUE,
+        rho BLOB,
+        memo TEXT,
+        spent INTEGER,
+        CONSTRAINT tx_output UNIQUE (position))";
+
+    async fn insert_legacy_note(
+        connection: &mut SqliteConnection,
+        position: u32,
+        nf: &[u8],
+        rho: Option<&[u8]>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO received_notes
+            (address, account, sub_account, id_tx, position, height,
+            diversifier, value, rcm, nf, rho, memo, spent)
+            VALUES ('addr',0,0,1,?1,100,x'00',1000,x'00',?2,?3,'',0)",
+        )
+        .bind(position)
+        .bind(nf)
+        .bind(rho)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_note(
+        connection: &mut SqliteConnection,
+        pool: u8,
+        position: u32,
+        nf: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO received_notes
+            (address, account, sub_account, id_tx, pool, position, height,
+            diversifier, value, rcm, nf, rho, memo, spent)
+            VALUES ('addr',0,0,1,?1,?2,100,x'00',1000,x'00',?3,NULL,'',0)",
+        )
+        .bind(pool)
+        .bind(position)
+        .bind(nf)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+
+    /// The migration must (a) recover each existing note's pool without a rescan and (b) key the
+    /// uniqueness constraint on `(pool, position)`. Ironwood's commitment tree restarts note
+    /// positions from zero at the NU6.3 activation height, so under the legacy
+    /// `UNIQUE (position)` constraint the first Ironwood receives would collide with the
+    /// wallet's low Sapling/Orchard positions and fail the whole scan batch.
+    #[tokio::test]
+    async fn migration_backfills_pools_and_rekeys_the_position_constraint() -> Result<()> {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await?;
+        sqlx::query(LEGACY_DDL).execute(&mut connection).await?;
+        // `rho` is set only on Orchard-family notes, which is what makes the pool of a
+        // pre-migration row recoverable.
+        insert_legacy_note(&mut connection, 7, b"sapling-nf", None).await?;
+        insert_legacy_note(&mut connection, 9, b"orchard-nf", Some(b"rho")).await?;
+
+        Db::migrate_received_notes_pool(&mut connection).await?;
+
+        let pools: Vec<(Vec<u8>, u8)> = sqlx::query("SELECT nf, pool FROM received_notes")
+            .map(|r: SqliteRow| (r.get(0), r.get(1)))
+            .fetch_all(&mut connection)
+            .await?;
+        assert_eq!(
+            pools,
+            vec![
+                (b"sapling-nf".to_vec(), POOL_SAPLING),
+                (b"orchard-nf".to_vec(), POOL_ORCHARD),
+            ]
+        );
+
+        // An Ironwood note at a position already used by another pool is now accepted...
+        insert_note(&mut connection, POOL_IRONWOOD, 7, b"ironwood-nf").await?;
+        // ...while a genuine duplicate within one pool is still rejected.
+        assert!(
+            insert_note(&mut connection, POOL_IRONWOOD, 7, b"ironwood-nf-2")
+                .await
+                .is_err()
+        );
+
+        // Re-running the migration is a no-op.
+        Db::migrate_received_notes_pool(&mut connection).await?;
+        let (count,): (u32,) = sqlx::query_as("SELECT COUNT(*) FROM received_notes")
+            .fetch_one(&mut connection)
+            .await?;
+        assert_eq!(count, 3);
+
+        Ok(())
     }
 }

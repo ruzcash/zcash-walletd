@@ -52,6 +52,12 @@ pub struct CompactTx {
     pub outputs: ::prost::alloc::vec::Vec<CompactSaplingOutput>,
     #[prost(message, repeated, tag = "6")]
     pub actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
+    /// Actions of the Ironwood (NU6.3) bundle. Ironwood reuses Orchard's action encoding and
+    /// keys, but its notes live in a *separate* commitment tree and use the V3 note-plaintext
+    /// lead byte, so they must be trial-decrypted with the Ironwood note-encryption domain and
+    /// positioned against the Ironwood tree. Only populated by versioned-protocol servers.
+    #[prost(message, repeated, tag = "9")]
+    pub ironwood_actions: ::prost::alloc::vec::Vec<CompactOrchardAction>,
 }
 /// CompactSaplingSpend is a Sapling Spend Description as described in 7.3 of the Zcash
 /// protocol specification.
@@ -103,14 +109,21 @@ pub struct BlockId {
 }
 /// BlockRange specifies a series of blocks from start to end inclusive.
 /// Both BlockIDs must be heights; specification by hash is not yet supported.
+///
+/// `poolTypes` selects which value pools the server should include in the returned
+/// compact blocks. It is part of the *versioned* lightwallet-protocol
+/// (https://github.com/zcash/lightwallet-protocol): a client MUST verify that the server
+/// advertises a non-empty `LightdInfo.lightwalletProtocolVersion` before setting it, because
+/// a legacy server may reject it or silently misinterpret tag 3. Leave it empty for the
+/// legacy default (Sapling + Orchard only).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockRange {
     #[prost(message, optional, tag = "1")]
     pub start: ::core::option::Option<BlockId>,
     #[prost(message, optional, tag = "2")]
     pub end: ::core::option::Option<BlockId>,
-    #[prost(uint64, tag = "3")]
-    pub spam_filter_threshold: u64,
+    #[prost(enumeration = "PoolType", repeated, tag = "3")]
+    pub pool_types: ::prost::alloc::vec::Vec<i32>,
 }
 /// A TxFilter contains the information needed to identify a particular
 /// transaction: either a block and an index, or a direct transaction hash.
@@ -195,6 +208,20 @@ pub struct LightdInfo {
     /// example: "/MagicBean:4.1.1/"
     #[prost(string, tag = "14")]
     pub zcashd_subversion: ::prost::alloc::string::String,
+    /// Zcash donation UA address
+    #[prost(string, tag = "15")]
+    pub donation_address: ::prost::alloc::string::String,
+    /// name of next pending network upgrade, empty if none scheduled
+    #[prost(string, tag = "16")]
+    pub upgrade_name: ::prost::alloc::string::String,
+    /// height of next pending upgrade, zero if none is scheduled
+    #[prost(uint64, tag = "17")]
+    pub upgrade_height: u64,
+    /// Version of https://github.com/zcash/lightwallet-protocol served by this server.
+    /// Empty on legacy (<= v0.4.x) servers; a non-empty value is what gates `BlockRange.poolTypes`
+    /// (and hence Ironwood data in compact blocks).
+    #[prost(string, tag = "18")]
+    pub lightwallet_protocol_version: ::prost::alloc::string::String,
 }
 /// TransparentAddressBlockFilter restricts the results to the given address
 /// or block range.
@@ -266,6 +293,9 @@ pub struct TreeState {
     /// orchard commitment tree state
     #[prost(string, tag = "6")]
     pub orchard_tree: ::prost::alloc::string::String,
+    /// ironwood (NU6.3) commitment tree state
+    #[prost(string, tag = "7")]
+    pub ironwood_tree: ::prost::alloc::string::String,
 }
 /// Results are sorted by height, which makes it easy to issue another
 /// request that picks up from where the previous left off.
@@ -298,6 +328,16 @@ pub struct GetAddressUtxosReply {
 pub struct GetAddressUtxosReplyList {
     #[prost(message, repeated, tag = "1")]
     pub address_utxos: ::prost::alloc::vec::Vec<GetAddressUtxosReply>,
+}
+/// An identifier for a Zcash value pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PoolType {
+    Invalid = 0,
+    Transparent = 1,
+    Sapling = 2,
+    Orchard = 3,
+    Ironwood = 4,
 }
 #[doc = r" Generated client implementations."]
 pub mod compact_tx_streamer_client {

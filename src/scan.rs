@@ -4,7 +4,9 @@ use anyhow::Result;
 use orchard::{
     keys::FullViewingKey,
     note::{ExtractedNoteCommitment, Nullifier},
-    note_encryption::{CompactAction, OrchardDomain},
+    note_encryption::{
+        CompactAction, DomainVersion, IronwoodVersion, NoteEncryptionDomain, OrchardVersion,
+    },
     primitives::redpallas::{Signature, SpendAuth},
     Action, Address,
 };
@@ -17,7 +19,7 @@ use sapling_crypto::{
 use thiserror::Error;
 use tonic::{transport::Channel, Request};
 use zcash_address::unified::{self, Encoding};
-use zcash_keys::encoding::AddressCodec;
+use zcash_keys::{encoding::AddressCodec, keys::UnifiedFullViewingKey};
 use zcash_note_encryption::{
     try_compact_note_decryption, try_note_decryption, EphemeralKeyBytes, ShieldedOutput,
 };
@@ -33,10 +35,19 @@ use zcash_protocol::{
 use crate::{
     lwd_rpc::{
         compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-        CompactOrchardAction, CompactSaplingOutput, TxFilter,
+        CompactOrchardAction, CompactSaplingOutput, Empty, PoolType, TxFilter,
     },
     network::Network, Client, Hash,
 };
+
+/// Pool codes recorded on a received note (and on the `receivers` row derived from it).
+pub const POOL_SAPLING: u8 = 1;
+pub const POOL_ORCHARD: u8 = 2;
+/// Ironwood (NU6.3). Ironwood notes are received at ordinary Orchard addresses — the pool
+/// distinction lives at the bundle / note-version level, not in the address encoding — but
+/// they live in their own commitment tree, so they need their own pool code to keep note
+/// positions unambiguous.
+pub const POOL_IRONWOOD: u8 = 3;
 
 pub async fn get_latest_height(client: &mut CompactTxStreamerClient<Channel>) -> Result<u32> {
     let latest_block_id = client
@@ -47,15 +58,94 @@ pub async fn get_latest_height(client: &mut CompactTxStreamerClient<Channel>) ->
     Ok(latest_height as u32)
 }
 
+/// The `BlockRange.poolTypes` selector to use against this server.
+///
+/// Ironwood actions only ride in compact blocks when they are explicitly requested, and the
+/// field is part of the *versioned* lightwallet-protocol: a client must confirm the server
+/// advertises `lightwalletProtocolVersion` before setting it, because a legacy server may
+/// reject it or misinterpret tag 3. Against a legacy server we send an empty selector and get
+/// the legacy default (Sapling + Orchard) — correct behaviour pre-NU6.3, and the operator
+/// needs an upgraded lightwalletd to see Ironwood receives once NU6.3 activates.
+pub async fn pool_types(client: &mut Client) -> Result<Vec<i32>> {
+    let info = client
+        .get_lightd_info(Request::new(Empty {}))
+        .await?
+        .into_inner();
+    if info.lightwallet_protocol_version.is_empty() {
+        log::warn!(
+            "lightwalletd {} does not advertise a lightwallet-protocol version; \
+             Ironwood (NU6.3) notes cannot be detected. Upgrade the server to scan NU6.3 blocks.",
+            info.version
+        );
+        Ok(vec![])
+    } else {
+        Ok(vec![
+            PoolType::Sapling as i32,
+            PoolType::Orchard as i32,
+            PoolType::Ironwood as i32,
+        ])
+    }
+}
+
+/// The per-pool trial-decryption state carried across a scan.
+pub struct Decoders {
+    pub sapling: Option<Decoder<Sapling>>,
+    pub orchard: Option<Decoder<Orchard>>,
+    pub ironwood: Option<Decoder<Ironwood>>,
+}
+
+impl Decoders {
+    /// Build the per-pool decoders for `ufvk`, seeded with the wallet's known nullifiers.
+    pub fn new(ufvk: &UnifiedFullViewingKey, nfs: &HashMap<Hash, u64>) -> Self {
+        let sapling = ufvk.sapling().map(|fvk| {
+            let nk = fvk.fvk().vk.nk;
+            let ivk = fvk.to_ivk(zip32::Scope::External);
+            let pivk = sapling_crypto::keys::PreparedIncomingViewingKey::new(&ivk);
+            Decoder::<Sapling>::new(nk, fvk.clone(), pivk, nfs)
+        });
+        let orchard = ufvk.orchard().map(|fvk| {
+            let ivk = fvk.to_ivk(zip32::Scope::External);
+            let pivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
+            Decoder::<Orchard>::new(fvk.clone(), ivk, pivk, nfs)
+        });
+        // Ironwood is received at the account's Orchard receivers and derives from the same
+        // Orchard key material — only the note plaintext version and the commitment tree
+        // differ — so its decoder is built from the very same FVK.
+        let ironwood = ufvk.orchard().map(|fvk| {
+            let ivk = fvk.to_ivk(zip32::Scope::External);
+            let pivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
+            Decoder::<Ironwood>::new(fvk.clone(), ivk, pivk, nfs)
+        });
+        Decoders {
+            sapling,
+            orchard,
+            ironwood,
+        }
+    }
+
+    /// Look a nullifier up against both Orchard-family decoders.
+    ///
+    /// Orchard and Ironwood derive nullifiers from the same account key, and a note is nullified
+    /// in whichever bundle owns its pool — an Orchard V2 note in the Orchard bundle, an Ironwood
+    /// V3 note in the Ironwood bundle — so a spend must be matched against both sets regardless
+    /// of which action list it was seen in.
+    fn orchard_family_nf(&self, nf: &Hash) -> Option<u64> {
+        self.orchard
+            .as_ref()
+            .and_then(|d| d.nfs.get(nf).copied())
+            .or_else(|| self.ironwood.as_ref().and_then(|d| d.nfs.get(nf).copied()))
+    }
+}
+
 pub async fn scan(
     network: &Network,
     client: &mut Client,
     start: u32,
     end: u32,
     prev_hash: &Hash,
-    sap_dec: &mut Option<Decoder<Sapling>>,
-    orc_dec: &mut Option<Decoder<Orchard>>,
+    decoders: &mut Decoders,
 ) -> Result<Vec<ScanEvent>, ScanError> {
+    let pool_types = pool_types(client).await.map_err(ScanError::Other)?;
     let tree_state = client
         .get_tree_state(Request::new(BlockId {
             height: start as u64,
@@ -75,7 +165,7 @@ pub async fn scan(
                 height: end as u64,
                 hash: vec![],
             }),
-            spam_filter_threshold: 0,
+            pool_types,
         }))
         .await
         .map_err(|e| ScanError::Other(anyhow::Error::new(e)))?
@@ -83,6 +173,9 @@ pub async fn scan(
     let mut prev_hash = *prev_hash;
     let mut sap_position = get_tree_size(&tree_state.sapling_tree).unwrap();
     let mut orc_position = get_tree_size(&tree_state.orchard_tree).unwrap();
+    // Ironwood has its own commitment tree, so its note positions are tracked separately from
+    // Orchard's. Empty (hence 0) before NU6.3 activates, and on servers that don't serve it.
+    let mut irw_position = get_tree_size(&tree_state.ironwood_tree).unwrap();
 
     let mut events = vec![];
     let mut new_txids = vec![];
@@ -97,7 +190,7 @@ pub async fn scan(
 
         for vtx in block.vtx.iter() {
             let mut found = false;
-            if let Some(sap_dec) = sap_dec {
+            if let Some(sap_dec) = decoders.sapling.as_mut() {
                 for i in vtx.spends.iter() {
                     let nf: &Hash = i.nf.as_slice().try_into().unwrap();
                     if let Some(value) = sap_dec.nfs.get(nf) {
@@ -125,17 +218,22 @@ pub async fn scan(
                 }
             }
 
-            if let Some(orc_dec) = orc_dec {
-                for (vout, a) in vtx.actions.iter().enumerate() {
-                    let nf: &Hash = a.nullifier.as_slice().try_into().unwrap();
-                    if let Some(value) = orc_dec.nfs.get(nf) {
-                        events.push(ScanEvent::Spent(SpentNote {
-                            height,
-                            nf: *nf,
-                            txid: vtx.hash.clone().try_into().unwrap(),
-                            value: *value,
-                        }));
-                    }
+            // Orchard and Ironwood actions are structurally identical and share the account's
+            // Orchard keys; they differ in the note-plaintext version (so each needs its own
+            // trial-decryption domain) and in which commitment tree positions them. A note is
+            // nullified in whichever bundle owns its pool, so spends are looked up against both
+            // decoders' nullifier sets.
+            for (vout, a) in vtx.actions.iter().enumerate() {
+                let nf: &Hash = a.nullifier.as_slice().try_into().unwrap();
+                if let Some(value) = decoders.orchard_family_nf(nf) {
+                    events.push(ScanEvent::Spent(SpentNote {
+                        height,
+                        nf: *nf,
+                        txid: vtx.hash.clone().try_into().unwrap(),
+                        value,
+                    }));
+                }
+                if let Some(orc_dec) = decoders.orchard.as_mut() {
                     if let Some(n) = orc_dec.try_compact_note_decryption(
                         network,
                         height,
@@ -150,6 +248,31 @@ pub async fn scan(
                 }
             }
 
+            for (vout, a) in vtx.ironwood_actions.iter().enumerate() {
+                let nf: &Hash = a.nullifier.as_slice().try_into().unwrap();
+                if let Some(value) = decoders.orchard_family_nf(nf) {
+                    events.push(ScanEvent::Spent(SpentNote {
+                        height,
+                        nf: *nf,
+                        txid: vtx.hash.clone().try_into().unwrap(),
+                        value,
+                    }));
+                }
+                if let Some(irw_dec) = decoders.ironwood.as_mut() {
+                    if let Some(n) = irw_dec.try_compact_note_decryption(
+                        network,
+                        height,
+                        &vtx.hash,
+                        irw_position + vout as u32,
+                        a,
+                    )? {
+                        irw_dec.add_nf(n.nf, n.value);
+                        events.push(ScanEvent::Received(n));
+                        found = true;
+                    }
+                }
+            }
+
             if found {
                 let txid: Hash = vtx.hash.clone().try_into().unwrap();
                 new_txids.push(WalletTx {
@@ -157,16 +280,18 @@ pub async fn scan(
                     txid,
                     sap_position,
                     orc_position,
+                    irw_position,
                 });
             }
 
             sap_position += vtx.outputs.len() as u32;
             orc_position += vtx.actions.len() as u32;
+            irw_position += vtx.ironwood_actions.len() as u32;
         }
     }
 
     for wtx in new_txids.iter() {
-        let memos = scan_tx(network, client, wtx, sap_dec, orc_dec).await?;
+        let memos = scan_tx(network, client, wtx, decoders).await?;
         for m in memos {
             events.push(ScanEvent::Memo(m));
         }
@@ -180,8 +305,7 @@ pub async fn scan_tx(
     network: &Network,
     client: &mut Client,
     wtx: &WalletTx,
-    sap_dec: &Option<Decoder<Sapling>>,
-    orc_dec: &Option<Decoder<Orchard>>,
+    decoders: &Decoders,
 ) -> Result<Vec<MemoNote>> {
     let mut notes = vec![];
     let raw_tx = client
@@ -195,7 +319,7 @@ pub async fn scan_tx(
     let tx = Transaction::read(&*raw_tx.data, branch_id)?;
     let tx = tx.into_data();
 
-    if let Some(sap_dec) = sap_dec {
+    if let Some(sap_dec) = decoders.sapling.as_ref() {
         if let Some(sapling_bundle) = tx.sapling_bundle() {
             for (vout, o) in sapling_bundle.shielded_outputs().iter().enumerate() {
                 if let Some(note) =
@@ -206,11 +330,24 @@ pub async fn scan_tx(
             }
         }
     }
-    if let Some(orc_dec) = orc_dec {
+    if let Some(orc_dec) = decoders.orchard.as_ref() {
         if let Some(orchard_bundle) = tx.orchard_bundle() {
             for (vout, a) in orchard_bundle.actions().iter().enumerate() {
                 if let Some(note) =
                     orc_dec.try_note_decryption(vout as u32 + wtx.orc_position, a)?
+                {
+                    notes.push(note);
+                }
+            }
+        }
+    }
+    // A V6 transaction carries the Orchard and Ironwood bundles side by side; memos for
+    // Ironwood notes are in the latter, decrypted with the Ironwood domain.
+    if let Some(irw_dec) = decoders.ironwood.as_ref() {
+        if let Some(ironwood_bundle) = tx.ironwood_bundle() {
+            for (vout, a) in ironwood_bundle.actions().iter().enumerate() {
+                if let Some(note) =
+                    irw_dec.try_note_decryption(vout as u32 + wtx.irw_position, a)?
                 {
                     notes.push(note);
                 }
@@ -347,7 +484,7 @@ impl Decode<Sapling> for Decoder<Sapling> {
 
             let note = ReceivedNote {
                 txid: txid.try_into().unwrap(),
-                pool: 1,
+                pool: POOL_SAPLING,
                 position,
                 height,
                 address,
@@ -400,6 +537,122 @@ impl Pool for Orchard {
     type Output = Action<Signature<SpendAuth>>;
 }
 
+/// Ironwood, the shielded pool introduced by NU6.3.
+///
+/// Ironwood reuses Orchard's keys, addresses and action encoding wholesale, so a wallet needs no
+/// new key material and no new address type to receive into it: an Ironwood note is simply
+/// received at an ordinary Orchard receiver. What differs is (a) the note plaintext version —
+/// lead byte `0x03` instead of Orchard's `0x02`, so trial decryption needs the Ironwood domain —
+/// and (b) the commitment tree, which is separate from Orchard's and therefore has its own
+/// note positions. Once NU6.3 activates, payments to an Orchard receiver are *routed to this
+/// pool*, so a wallet that only scans `CompactTx.actions` stops seeing its own incoming
+/// payments.
+pub struct Ironwood;
+
+impl Pool for Ironwood {
+    type Address = Address;
+    type NullifierKey = FullViewingKey;
+    type DiversifierKey = orchard::keys::IncomingViewingKey;
+    type PreparedIncomingViewingKey = orchard::keys::PreparedIncomingViewingKey;
+    type CompactOutput = CompactOrchardAction;
+    type Output = Action<Signature<SpendAuth>>;
+}
+
+/// The account keys shared by the Orchard-family pools, plus the pool code to tag notes with.
+struct OrchardFamilyKeys<'a> {
+    nk: &'a FullViewingKey,
+    dk: &'a orchard::keys::IncomingViewingKey,
+    pivk: &'a orchard::keys::PreparedIncomingViewingKey,
+    pool: u8,
+}
+
+/// Trial-decrypt a compact Orchard-family action under the note-plaintext version `V`
+/// (`OrchardVersion` for the Orchard bundle, `IronwoodVersion` for the Ironwood bundle).
+fn orchard_family_compact_decryption<V: DomainVersion>(
+    keys: &OrchardFamilyKeys<'_>,
+    network: &Network,
+    height: u32,
+    txid: &[u8],
+    position: u32,
+    action: &CompactOrchardAction,
+) -> Result<Option<ReceivedNote>> {
+    let epk: &[u8; 32] = action.ephemeral_key.as_slice().try_into().unwrap();
+    let ca = CompactAction::from_parts(
+        Nullifier::from_bytes(action.nullifier.as_slice().try_into().unwrap()).unwrap(),
+        ExtractedNoteCommitment::from_bytes(action.cmx.as_slice().try_into().unwrap()).unwrap(),
+        EphemeralKeyBytes(*epk),
+        action.ciphertext.as_slice().try_into().unwrap(),
+    );
+    let domain = NoteEncryptionDomain::<V>::for_compact_action(&ca);
+    if let Some((note, address)) = try_compact_note_decryption(&domain, keys.pivk, &ca) {
+        let ua = unified::Receiver::Orchard(address.to_raw_address_bytes());
+        let ua = unified::Address::try_from_items(vec![ua])?;
+        let ua = ua.encode(&network.network_type());
+        let diversifier = *address.diversifier().as_array();
+        let value = note.value().inner();
+        let rcm = *note.rseed().as_bytes();
+        let nf = note.nullifier(keys.nk);
+        let rho = note.rho().to_bytes();
+        let di = orchard_family_diversifier(keys.dk, &address)?;
+
+        let note = ReceivedNote {
+            txid: txid.try_into().unwrap(),
+            pool: keys.pool,
+            position,
+            height,
+            address: ua,
+            diversifier,
+            diversifier_index: di,
+            value,
+            rcm,
+            nf: nf.to_bytes(),
+            rho: Some(rho),
+        };
+        return Ok(Some(note));
+    }
+    Ok(None)
+}
+
+/// Full trial decryption of an Orchard-family action, to recover the note's memo.
+fn orchard_family_note_decryption<V: DomainVersion>(
+    keys: &OrchardFamilyKeys<'_>,
+    action: &Action<Signature<SpendAuth>>,
+) -> Result<Option<MemoNote>> {
+    let domain = NoteEncryptionDomain::<V>::for_action(action);
+    if let Some((note, _address, memo_bytes)) = try_note_decryption(&domain, keys.pivk, action) {
+        let nf = note.nullifier(keys.nk);
+        let memo_note = MemoNote {
+            nf: nf.to_bytes(),
+            memo: memo_text(&memo_bytes)?,
+        };
+        return Ok(Some(memo_note));
+    }
+
+    Ok(None)
+}
+
+fn orchard_family_diversifier(
+    dk: &orchard::keys::IncomingViewingKey,
+    address: &Address,
+) -> Result<Option<u64>> {
+    if let Some(di) = dk.diversifier_index(address) {
+        let di: u64 = di.try_into()?;
+        return Ok(Some(di));
+    }
+    Ok(None)
+}
+
+impl Decoder<Orchard> {
+    fn keys(&self) -> OrchardFamilyKeys<'_> {
+        OrchardFamilyKeys {
+            nk: &self.nk,
+            dk: &self.dk,
+            pivk: &self.pivk,
+            pool: POOL_ORCHARD,
+        }
+    }
+}
+
 impl Decode<Orchard> for Decoder<Orchard> {
     fn try_compact_note_decryption(
         &self,
@@ -409,41 +662,14 @@ impl Decode<Orchard> for Decoder<Orchard> {
         position: u32,
         action: &CompactOrchardAction,
     ) -> Result<Option<ReceivedNote>> {
-        let epk: &[u8; 32] = action.ephemeral_key.as_slice().try_into().unwrap();
-        let ca = CompactAction::from_parts(
-            Nullifier::from_bytes(action.nullifier.as_slice().try_into().unwrap()).unwrap(),
-            ExtractedNoteCommitment::from_bytes(action.cmx.as_slice().try_into().unwrap()).unwrap(),
-            EphemeralKeyBytes(*epk),
-            action.ciphertext.as_slice().try_into().unwrap(),
-        );
-        let domain = OrchardDomain::for_compact_action(&ca);
-        if let Some((note, address)) = try_compact_note_decryption(&domain, &self.pivk, &ca) {
-            let ua = unified::Receiver::Orchard(address.to_raw_address_bytes());
-            let ua = unified::Address::try_from_items(vec![ua])?;
-            let ua = ua.encode(&network.network_type());
-            let diversifier = *address.diversifier().as_array();
-            let value = note.value().inner();
-            let rcm = *note.rseed().as_bytes();
-            let nf = note.nullifier(&self.nk);
-            let rho = note.rho().to_bytes();
-            let di = self.decrypt_diversifier(&address)?;
-
-            let note = ReceivedNote {
-                txid: txid.try_into().unwrap(),
-                pool: 2,
-                position,
-                height,
-                address: ua,
-                diversifier,
-                diversifier_index: di,
-                value,
-                rcm,
-                nf: nf.to_bytes(),
-                rho: Some(rho),
-            };
-            return Ok(Some(note));
-        }
-        Ok(None)
+        orchard_family_compact_decryption::<OrchardVersion>(
+            &self.keys(),
+            network,
+            height,
+            txid,
+            position,
+            action,
+        )
     }
 
     fn try_note_decryption(
@@ -451,26 +677,54 @@ impl Decode<Orchard> for Decoder<Orchard> {
         _position: u32,
         action: &Action<Signature<SpendAuth>>,
     ) -> Result<Option<MemoNote>> {
-        let domain = OrchardDomain::for_action(action);
-        if let Some((note, _address, memo_bytes)) = try_note_decryption(&domain, &self.pivk, action)
-        {
-            let nf = note.nullifier(&self.nk);
-            let memo_note = MemoNote {
-                nf: nf.to_bytes(),
-                memo: memo_text(&memo_bytes)?,
-            };
-            return Ok(Some(memo_note));
-        }
-
-        Ok(None)
+        orchard_family_note_decryption::<OrchardVersion>(&self.keys(), action)
     }
 
     fn decrypt_diversifier(&self, address: &Address) -> Result<Option<u64>> {
-        if let Some(di) = self.dk.diversifier_index(address) {
-            let di: u64 = di.try_into()?;
-            return Ok(Some(di));
+        orchard_family_diversifier(&self.dk, address)
+    }
+}
+
+impl Decoder<Ironwood> {
+    fn keys(&self) -> OrchardFamilyKeys<'_> {
+        OrchardFamilyKeys {
+            nk: &self.nk,
+            dk: &self.dk,
+            pivk: &self.pivk,
+            pool: POOL_IRONWOOD,
         }
-        Ok(None)
+    }
+}
+
+impl Decode<Ironwood> for Decoder<Ironwood> {
+    fn try_compact_note_decryption(
+        &self,
+        network: &Network,
+        height: u32,
+        txid: &[u8],
+        position: u32,
+        action: &CompactOrchardAction,
+    ) -> Result<Option<ReceivedNote>> {
+        orchard_family_compact_decryption::<IronwoodVersion>(
+            &self.keys(),
+            network,
+            height,
+            txid,
+            position,
+            action,
+        )
+    }
+
+    fn try_note_decryption(
+        &self,
+        _position: u32,
+        action: &Action<Signature<SpendAuth>>,
+    ) -> Result<Option<MemoNote>> {
+        orchard_family_note_decryption::<IronwoodVersion>(&self.keys(), action)
+    }
+
+    fn decrypt_diversifier(&self, address: &Address) -> Result<Option<u64>> {
+        orchard_family_diversifier(&self.dk, address)
     }
 }
 
@@ -519,6 +773,7 @@ pub struct WalletTx {
     pub txid: Hash,
     pub sap_position: u32,
     pub orc_position: u32,
+    pub irw_position: u32,
 }
 
 pub fn memo_text(memo_bytes: &[u8]) -> Result<String> {
@@ -557,17 +812,7 @@ mod tests {
             hex::decode("5f03d35ae940bb840564c3b7af7ab72255096d3eca15c910c0e40d0000000000")
                 .unwrap();
         let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&Network::Main, FVK).unwrap();
-        let mut sap_dec = ufvk.sapling().map(|fvk| {
-            let nk = fvk.fvk().vk.nk;
-            let ivk = fvk.to_ivk(zip32::Scope::External);
-            let pivk = sapling_crypto::keys::PreparedIncomingViewingKey::new(&ivk);
-            Decoder::<Sapling>::new(nk, fvk.clone(), pivk, &HashMap::new())
-        });
-        let mut orc_dec = ufvk.orchard().map(|fvk| {
-            let ivk = fvk.to_ivk(zip32::Scope::External);
-            let pivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
-            Decoder::<Orchard>::new(fvk.clone(), ivk, pivk, &HashMap::new())
-        });
+        let mut decoders = Decoders::new(&ufvk, &HashMap::new());
 
         let events = scan(
             &Network::Main,
@@ -575,14 +820,19 @@ mod tests {
             2_890_000,
             2_900_000,
             &prev_hash.try_into().unwrap(),
-            &mut sap_dec,
-            &mut orc_dec,
+            &mut decoders,
         )
         .await?;
 
         println!("{events:?}");
 
-        let db = Db::new(Network::Main, "zec-wallet-test.db", &ufvk, "").await?;
+        // Scratch database, recreated on each run: `store_events` is not idempotent (note
+        // nullifiers are UNIQUE), and `Db::new` alone does not build the schema.
+        let db_path = std::env::temp_dir().join("zec-wallet-test.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Db::new(Network::Main, &db_path.to_string_lossy(), &ufvk, "").await?;
+        db.create().await?;
+        db.new_account("").await?;
         db.store_events(&events).await?;
 
         Ok(())

@@ -39,7 +39,7 @@ bls12_381 = "0.8"
 jubjub = "0.10"
 ff = "0.13"
 group = "0.13"
-orchard = "0.14.0"
+orchard = "0.15"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
@@ -49,16 +49,21 @@ sapling-crypto = "0.7"
 zcash_note_encryption = "0.4.1"
 zip32 = "0.2"
 
-zcash_client_backend = { version = "0.23", features = [
+# NU6.3 (Ironwood) support: the librustzcash "ironwood" line, consumed from crates.io. The
+# leaf crates are finals; the wallet crates are still release candidates — move these reqs to
+# the finals once they publish. Ironwood is *not* a cargo feature: the published line exposes
+# the ironwood APIs unconditionally, and activation is purely consensus-height driven
+# (`NetworkUpgrade::Nu6_3`), so a plain `cargo build` is NU6.3-ready on every network.
+zcash_client_backend = { version = "0.24.0-rc.4", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "transparent-inputs",
 ] }
-zcash_keys = { version = "0.14", features = ["orchard", "sapling"] }
-zcash_protocol = { version = "0.9", features = ["local-consensus"] }
-zcash_address = { version = "0.12" }
-zcash_primitives = "0.28"
-zcash_proofs = "0.28"
+zcash_keys = { version = "0.16", features = ["orchard", "sapling"] }
+zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+zcash_address = { version = "0.13" }
+zcash_primitives = "0.30"
+zcash_proofs = "0.30"
 
 [build-dependencies]
 tonic-build = "0.4.2"
