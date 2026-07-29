@@ -83,10 +83,7 @@ pub async fn get_accounts(
     db: &State<Db>,
     config: &State<WalletConfig>,
 ) -> Result<Json<GetAccountsResponse>, Debug<anyhow::Error>> {
-    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone())
-        .await
-        .map_err(from_tonic)?;
-    let latest_height = get_latest_height(&mut client).await?;
+    let latest_height = db.get_synced_height().await?;
     let sub_accounts = db.get_accounts(latest_height, config.confirmations).await?;
     let total_balance: u64 = sub_accounts.iter().map(|sa| sa.balance).sum();
     let total_unlocked_balance: u64 = sub_accounts.iter().map(|sa| sa.unlocked_balance).sum();
@@ -118,10 +115,7 @@ pub async fn get_transaction(
     config: &State<WalletConfig>,
 ) -> Result<Json<GetTransactionByIdResponse>, Debug<anyhow::Error>> {
     let request = request.into_inner();
-    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone())
-        .await
-        .map_err(from_tonic)?;
-    let latest_height = get_latest_height(&mut client).await?;
+    let latest_height = db.get_synced_height().await?;
     let transfers = db
         .get_transfers_by_txid(
             latest_height,
@@ -161,10 +155,7 @@ pub async fn get_transfers(
 ) -> Result<Json<GetTransfersResponse>, Debug<anyhow::Error>> {
     let request = request.into_inner();
     assert!(request.r#in);
-    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone())
-        .await
-        .map_err(from_tonic)?;
-    let latest_height = get_latest_height(&mut client).await?;
+    let latest_height = db.get_synced_height().await?;
     let transfers = db
         .get_transfers(
             latest_height,
@@ -211,14 +202,10 @@ pub struct GetHeightResponse {
 #[post("/get_height", data = "<_request>")]
 pub async fn get_height(
     _request: Json<GetHeightRequest>,
-    config: &State<WalletConfig>,
+    db: &State<Db>,
 ) -> Result<Json<GetHeightResponse>, Debug<anyhow::Error>> {
-    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone())
-        .await
-        .map_err(from_tonic)?;
-    let latest_height = get_latest_height(&mut client).await?;
     let rep = GetHeightResponse {
-        height: latest_height,
+        height: db.get_synced_height().await?,
     };
     Ok(Json(rep))
 }
@@ -246,8 +233,10 @@ pub async fn sync_info(
         .map_err(from_tonic)?
         .into_inner();
     let rep = SyncInfoResponse {
-        target_height: rep.block_height as u32,
-        height: rep.estimated_height as u32,
+        target_height: u32::try_from(rep.block_height)
+            .map_err(|_| anyhow::anyhow!("block height exceeds u32"))?,
+        height: u32::try_from(rep.estimated_height)
+            .map_err(|_| anyhow::anyhow!("estimated height exceeds u32"))?,
     };
     Ok(Json(rep))
 }
@@ -257,6 +246,7 @@ pub async fn request_scan(
     db: &State<Db>,
     config: &State<WalletConfig>,
 ) -> Result<(), Debug<anyhow::Error>> {
+    let _guard = db.lock_scan().await;
     let network = config.network();
     let ufvk = db.ufvk();
     let start = db.get_synced_height().await?;
@@ -294,7 +284,7 @@ pub async fn request_scan(
             match error {
                 ScanError::Reorganization => {
                     let synced_height = db.get_synced_height().await?;
-                    db.truncate_height(synced_height - SAFE_REORG_DISTANCE)
+                    db.truncate_height(synced_height.saturating_sub(SAFE_REORG_DISTANCE))
                         .await
                 }
                 ScanError::Other(error) => Err(error),
@@ -311,11 +301,10 @@ pub async fn request_scan(
 pub const SAFE_REORG_DISTANCE: u32 = 100u32;
 
 #[post("/reorg")]
-pub async fn reorg(
-    db: &State<Db>,
-) -> Result<(), Debug<anyhow::Error>> {
+pub async fn reorg(db: &State<Db>) -> Result<(), Debug<anyhow::Error>> {
+    let _guard = db.lock_scan().await;
     let synced_height = db.get_synced_height().await?;
-    db.truncate_height(synced_height - SAFE_REORG_DISTANCE)
+    db.truncate_height(synced_height.saturating_sub(SAFE_REORG_DISTANCE))
         .await?;
     Ok(())
 }
