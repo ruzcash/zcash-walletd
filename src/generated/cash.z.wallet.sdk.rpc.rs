@@ -1,3 +1,13 @@
+/// Information about the state of the chain as of a given block.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChainMetadata {
+    #[prost(uint32, tag = "1")]
+    pub sapling_commitment_tree_size: u32,
+    #[prost(uint32, tag = "2")]
+    pub orchard_commitment_tree_size: u32,
+    #[prost(uint32, tag = "3")]
+    pub ironwood_commitment_tree_size: u32,
+}
 /// CompactBlock is a packaging of ONLY the data from a block that's needed to:
 ///   1. Detect a payment to your shielded Sapling address
 ///   2. Detect a spend of your shielded Sapling notes
@@ -25,6 +35,8 @@ pub struct CompactBlock {
     /// zero or more compact transactions from this block
     #[prost(message, repeated, tag = "7")]
     pub vtx: ::prost::alloc::vec::Vec<CompactTx>,
+    #[prost(message, optional, tag = "8")]
+    pub chain_metadata: ::core::option::Option<ChainMetadata>,
 }
 /// CompactTx contains the minimum information for a wallet to know if this transaction
 /// is relevant to it (either pays to it or spends from it) via shielded elements
@@ -114,8 +126,8 @@ pub struct BlockId {
 /// compact blocks. It is part of the *versioned* lightwallet-protocol
 /// (https://github.com/zcash/lightwallet-protocol): a client MUST verify that the server
 /// advertises a non-empty `LightdInfo.lightwalletProtocolVersion` before setting it, because
-/// a legacy server may reject it or silently misinterpret tag 3. Leave it empty for the
-/// legacy default (Sapling + Orchard only).
+/// a legacy server may reject it or silently misinterpret tag 3. Leave it empty to request
+/// the default shielded pools (Sapling, Orchard, and Ironwood).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockRange {
     #[prost(message, optional, tag = "1")]
@@ -218,8 +230,7 @@ pub struct LightdInfo {
     #[prost(uint64, tag = "17")]
     pub upgrade_height: u64,
     /// Version of https://github.com/zcash/lightwallet-protocol served by this server.
-    /// Empty on legacy (<= v0.4.x) servers; a non-empty value is what gates `BlockRange.poolTypes`
-    /// (and hence Ironwood data in compact blocks).
+    /// Empty on legacy servers and some v0.5 implementations.
     #[prost(string, tag = "18")]
     pub lightwallet_protocol_version: ::prost::alloc::string::String,
 }

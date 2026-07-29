@@ -29,11 +29,13 @@ const RECEIVED_NOTES_DDL: &str = "CREATE TABLE IF NOT EXISTS received_notes (
     diversifier BLOB NOT NULL,
     value INTEGER NOT NULL,
     rcm BLOB NOT NULL,
-    nf BLOB NOT NULL UNIQUE,
+    nf BLOB NOT NULL,
     rho BLOB,
     memo TEXT,
-    spent INTEGER,
-    CONSTRAINT tx_output UNIQUE (pool, position))";
+    spent_height INTEGER,
+    CONSTRAINT tx_output UNIQUE (pool, position),
+    CONSTRAINT note_nullifier UNIQUE (pool, nf))";
+const IRONWOOD_REPLAY_KEY: &str = "ironwood_replay_complete";
 
 pub struct Db {
     network: Network,
@@ -41,6 +43,7 @@ pub struct Db {
     ufvk: UnifiedFullViewingKey,
     notify_tx_url: String,
     address_creation_lock: Mutex<()>,
+    scan_lock: Mutex<()>,
 }
 
 impl Db {
@@ -60,6 +63,7 @@ impl Db {
             ufvk: ufvk.clone(),
             notify_tx_url: notify_tx_url.to_string(),
             address_creation_lock: Mutex::new(()),
+            scan_lock: Mutex::new(()),
         })
     }
 
@@ -75,51 +79,70 @@ impl Db {
     /// existing row is recoverable without rescanning: `rho` is only ever set for
     /// Orchard-family notes, so a NULL `rho` means Sapling. No pre-migration row can be
     /// Ironwood — the pool did not exist.
-    async fn migrate_received_notes_pool(connection: &mut SqliteConnection) -> Result<()> {
-        if sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'pool'")
-            .fetch_optional(&mut *connection)
-            .await?
-            .is_some()
-        {
-            return Ok(());
+    async fn migrate_received_notes_pool(connection: &mut SqliteConnection) -> Result<bool> {
+        let has_pool =
+            sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'pool'")
+                .fetch_optional(&mut *connection)
+                .await?
+                .is_some();
+        let has_spent_height = sqlx::query(
+            "SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'spent_height'",
+        )
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some();
+        if has_pool && has_spent_height {
+            return Ok(false);
         }
         log::info!("Migrating received_notes to the pool-aware (NU6.3) schema");
 
         let mut db_transaction = connection.begin().await?;
         let db_tx = db_transaction.acquire().await?;
+        let (before_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM received_notes")
+            .fetch_one(&mut *db_tx)
+            .await?;
         sqlx::query(&RECEIVED_NOTES_DDL.replace("received_notes", "received_notes_new"))
             .execute(&mut *db_tx)
             .await?;
-        sqlx::query(
+        let pool = if has_pool {
+            "pool"
+        } else {
+            "CASE WHEN rho IS NULL THEN ?1 ELSE ?2 END"
+        };
+        let spent_height = if has_spent_height {
+            "spent_height"
+        } else {
+            "CASE WHEN spent IS NULL OR spent = 0 THEN NULL ELSE 0 END"
+        };
+        let copy = format!(
             "INSERT INTO received_notes_new
             (id_note, address, account, sub_account, id_tx, pool, position, height,
-            diversifier, value, rcm, nf, rho, memo, spent)
-            SELECT id_note, address, account, sub_account, id_tx,
-            CASE WHEN rho IS NULL THEN ?1 ELSE ?2 END,
-            position, height, diversifier, value, rcm, nf, rho, memo, spent
-            FROM received_notes",
-        )
-        .bind(POOL_SAPLING)
-        .bind(POOL_ORCHARD)
-        .execute(&mut *db_tx)
-        .await?;
+            diversifier, value, rcm, nf, rho, memo, spent_height)
+            SELECT id_note, address, account, sub_account, id_tx, {pool},
+            position, height, diversifier, value, rcm, nf, rho, memo, {spent_height}
+            FROM received_notes"
+        );
+        let mut copy = sqlx::query(&copy);
+        if !has_pool {
+            copy = copy.bind(POOL_SAPLING).bind(POOL_ORCHARD);
+        }
+        copy.execute(&mut *db_tx).await?;
         sqlx::query("DROP TABLE received_notes")
             .execute(&mut *db_tx)
             .await?;
         sqlx::query("ALTER TABLE received_notes_new RENAME TO received_notes")
             .execute(&mut *db_tx)
             .await?;
+        let (after_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM received_notes")
+            .fetch_one(&mut *db_tx)
+            .await?;
+        anyhow::ensure!(
+            before_count == after_count,
+            "received_notes migration lost rows"
+        );
         db_transaction.commit().await?;
 
-        Ok(())
-    }
-
-    async fn cleanup_stale_data(connection: &mut SqliteConnection) -> Result<()> {
-        sqlx::query("DELETE FROM received_notes WHERE height >=
-            (SELECT MAX(height) FROM blocks)")
-        .execute(connection)
-        .await?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn new_account(&self, name: &str) -> Result<Account> {
@@ -226,11 +249,11 @@ impl Db {
         confirmations: u32,
     ) -> Result<Vec<AccountBalance>> {
         let mut connection = self.pool.acquire().await?;
-        let confirmed_height = height - confirmations + 1;
+        let confirmed_height = height.saturating_sub(confirmations.saturating_sub(1));
         let sub_accounts = sqlx::query(
             "WITH base AS (SELECT account, address FROM addresses WHERE sub_account = 0), \
-                balances AS (SELECT account, SUM(value) AS total from received_notes WHERE spent IS NULL GROUP BY account), \
-                unlocked_balances AS (SELECT account, SUM(value) AS unlocked from received_notes WHERE spent IS NULL AND height <= ?1 GROUP BY account) \
+                balances AS (SELECT account, SUM(value) AS total from received_notes WHERE spent_height IS NULL GROUP BY account), \
+                unlocked_balances AS (SELECT account, SUM(value) AS unlocked from received_notes WHERE spent_height IS NULL AND height <= ?1 GROUP BY account) \
                 SELECT a.account, a.label, b.total, COALESCE(u.unlocked, 0) AS unlocked, base.address as base_address \
                 FROM addresses a JOIN balances b ON a.account = b.account LEFT JOIN unlocked_balances u ON u.account = a.account JOIN base ON base.account = a.account GROUP BY a.account")
             .bind(confirmed_height)
@@ -305,7 +328,7 @@ impl Db {
         Transfer {
             address,
             amount: value,
-            confirmations: latest_height - height + 1,
+            confirmations: latest_height.saturating_sub(height).saturating_add(1),
             height,
             fee: 0,
             note: memo,
@@ -377,24 +400,88 @@ impl Db {
 
     pub async fn truncate_height(&self, height: u32) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
+        Self::truncate_to_checkpoint(&mut connection, height).await?;
+        Ok(())
+    }
 
-        sqlx::query("DELETE FROM transactions WHERE height >= ?1")
-            .bind(height)
-            .execute(&mut *connection)
+    async fn truncate_to_checkpoint(connection: &mut SqliteConnection, height: u32) -> Result<u32> {
+        let mut transaction = connection.begin().await?;
+        let db_tx = transaction.acquire().await?;
+        let (checkpoint,): (Option<u32>,) = sqlx::query_as(
+            "SELECT COALESCE(
+                (SELECT MAX(height) FROM blocks WHERE height < ?1),
+                (SELECT MIN(height) FROM blocks))",
+        )
+        .bind(height)
+        .fetch_one(&mut *db_tx)
+        .await?;
+        let checkpoint = checkpoint
+            .ok_or_else(|| anyhow::anyhow!("no wallet checkpoint exists below height {height}"))?;
+
+        sqlx::query("DELETE FROM received_notes WHERE height > ?1")
+            .bind(checkpoint)
+            .execute(&mut *db_tx)
             .await?;
-        sqlx::query("DELETE FROM received_notes WHERE height >= ?1")
-            .bind(height)
-            .execute(&mut *connection)
+        sqlx::query("DELETE FROM transactions WHERE height > ?1")
+            .bind(checkpoint)
+            .execute(&mut *db_tx)
             .await?;
-        sqlx::query("DELETE FROM blocks WHERE height >= ?1")
-            .bind(height)
-            .execute(&mut *connection)
+        sqlx::query("DELETE FROM blocks WHERE height > ?1")
+            .bind(checkpoint)
+            .execute(&mut *db_tx)
             .await?;
-        sqlx::query("UPDATE received_notes SET spent = NULL WHERE spent >= ?1")
-            .bind(height)
-            .execute(&mut *connection)
+        sqlx::query("UPDATE received_notes SET spent_height = NULL WHERE spent_height > ?1")
+            .bind(checkpoint)
+            .execute(&mut *db_tx)
             .await?;
 
+        transaction.commit().await?;
+        Ok(checkpoint)
+    }
+
+    pub async fn rewind_for_ironwood(&self, height: u32, hash: &Hash) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin().await?;
+        let db_tx = transaction.acquire().await?;
+
+        sqlx::query("DELETE FROM received_notes WHERE height > ?1")
+            .bind(height)
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query("UPDATE transactions SET value = 0 WHERE height > ?1")
+            .bind(height)
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query("DELETE FROM blocks WHERE height > ?1")
+            .bind(height)
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query("UPDATE received_notes SET spent_height = NULL WHERE spent_height > ?1")
+            .bind(height)
+            .execute(&mut *db_tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO blocks(height, hash) VALUES (?1, ?2)
+             ON CONFLICT(height) DO UPDATE SET hash = excluded.hash",
+        )
+        .bind(height)
+        .bind(hash.as_slice())
+        .execute(&mut *db_tx)
+        .await?;
+        sqlx::query("INSERT OR REPLACE INTO wallet_metadata(key, value) VALUES (?1, '1')")
+            .bind(IRONWOOD_REPLAY_KEY)
+            .execute(&mut *db_tx)
+            .await?;
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn complete_ironwood_replay(&self) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO wallet_metadata(key, value) VALUES (?1, '1')")
+            .bind(IRONWOOD_REPLAY_KEY)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -406,14 +493,7 @@ impl Db {
             .await?
             .is_none()
         {
-            let b = client
-                .get_block(Request::new(BlockId {
-                    height: height as u64,
-                    hash: vec![],
-                }))
-                .await?
-                .into_inner();
-            let hash: Hash = b.hash.try_into().unwrap();
+            let hash = Self::fetch_canonical_block_hash(client, height).await?;
             sqlx::query(
                 "INSERT INTO blocks(hash, height)
             VALUES (?1, ?2)",
@@ -426,22 +506,43 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get_nfs(&self) -> Result<HashMap<[u8; 32], u64>> {
+    pub async fn fetch_canonical_block_hash(client: &mut Client, height: u32) -> Result<Hash> {
+        let block = client
+            .get_block(Request::new(BlockId {
+                height: u64::from(height),
+                hash: vec![],
+            }))
+            .await?
+            .into_inner();
+        anyhow::ensure!(block.height == u64::from(height), "unexpected block height");
+        block.hash.try_into().map_err(|hash: Vec<u8>| {
+            anyhow::anyhow!(
+                "block hash must contain exactly 32 bytes, got {}",
+                hash.len()
+            )
+        })
+    }
+
+    pub async fn get_nfs(&self) -> Result<HashMap<(u8, [u8; 32]), u64>> {
         let mut connection = self.pool.acquire().await?;
-
-        let nfs = sqlx::query("SELECT nf, value FROM received_notes WHERE spent = 0")
-            .map(|row: SqliteRow| {
-                let nf: Vec<u8> = row.get(0);
-                let value: u64 = row.get(1);
-                let nf: Hash = nf.try_into().unwrap();
-                (nf, value)
-            })
-            .fetch_all(&mut *connection)
-            .await?;
-
+        let rows = sqlx::query(
+            "SELECT pool, nf, value FROM received_notes
+                 WHERE spent_height IS NULL OR spent_height = 0",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
         let mut nf_map = HashMap::new();
-        for (nf, value) in nfs {
-            nf_map.insert(nf, value);
+        for row in rows {
+            let pool: u8 = row.try_get(0)?;
+            let nf: Vec<u8> = row.try_get(1)?;
+            let value: u64 = row.try_get(2)?;
+            let nf: Hash = nf.try_into().map_err(|nf: Vec<u8>| {
+                anyhow::anyhow!(
+                    "stored nullifier must contain exactly 32 bytes, got {}",
+                    nf.len()
+                )
+            })?;
+            nf_map.insert((pool, nf), value);
         }
         Ok(nf_map)
     }
@@ -461,8 +562,16 @@ impl Db {
         Ok((ndi, ua))
     }
 
-    pub async fn create(&self) -> Result<bool> {
+    pub async fn create(&self) -> Result<(bool, bool)> {
         let mut connection = self.pool.acquire().await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS wallet_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL)",
+        )
+        .execute(&mut *connection)
+        .await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS blocks (
@@ -508,8 +617,6 @@ impl Db {
             .execute(&mut *connection)
             .await?;
 
-        Self::cleanup_stale_data(&mut connection).await?;
-
         if sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'rho'")
             .fetch_optional(&mut *connection)
             .await?
@@ -519,13 +626,18 @@ impl Db {
         }
 
         Self::migrate_received_notes_pool(&mut connection).await?;
+        let ironwood_replay_pending = sqlx::query("SELECT 1 FROM wallet_metadata WHERE key = ?1")
+            .bind(IRONWOOD_REPLAY_KEY)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_none();
 
         let r = sqlx::query("SELECT 1 FROM addresses")
             .map(|r: SqliteRow| r.get::<u32, _>(0))
             .fetch_optional(&mut *connection)
             .await?;
 
-        Ok(r.is_some())
+        Ok((r.is_some(), ironwood_replay_pending))
     }
 
     pub async fn store_events(&self, events: &[ScanEvent]) -> Result<()> {
@@ -613,8 +725,8 @@ impl Db {
                     sqlx::query(
                         "INSERT INTO received_notes
                         (address, account, sub_account, id_tx, pool, position, height,
-                        diversifier, value, rcm, nf, rho, memo, spent)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'',0)",
+                        diversifier, value, rcm, nf, rho, memo, spent_height)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'',NULL)",
                     )
                     .bind(&received_note.address)
                     .bind(account)
@@ -637,19 +749,25 @@ impl Db {
                         .await?;
                 }
                 ScanEvent::Spent(spent_note) => {
-                    let (_, is_new) = self.create_tx_if_not_exists(
-                        spent_note.height,
-                        spent_note.txid.as_slice(),
-                        db_tx,
-                    )
-                    .await?;
+                    let (_, is_new) = self
+                        .create_tx_if_not_exists(
+                            spent_note.height,
+                            spent_note.txid.as_slice(),
+                            db_tx,
+                        )
+                        .await?;
                     if is_new {
                         notify_txids.push(spent_note.txid);
                     }
-                    sqlx::query("UPDATE received_notes SET spent = TRUE WHERE nf = ?1")
-                        .bind(spent_note.nf.as_slice())
-                        .execute(&mut *db_tx)
-                        .await?;
+                    sqlx::query(
+                        "UPDATE received_notes SET spent_height = ?3
+                         WHERE pool = ?1 AND nf = ?2",
+                    )
+                    .bind(spent_note.pool)
+                    .bind(spent_note.nf.as_slice())
+                    .bind(spent_note.height)
+                    .execute(&mut *db_tx)
+                    .await?;
                     sqlx::query("UPDATE transactions SET value = value - ?2 WHERE txid = ?1")
                         .bind(spent_note.txid.as_slice())
                         .bind(spent_note.value as i64)
@@ -657,7 +775,8 @@ impl Db {
                         .await?;
                 }
                 ScanEvent::Memo(memo_note) => {
-                    sqlx::query("UPDATE received_notes SET memo = ?2 WHERE nf = ?1")
+                    sqlx::query("UPDATE received_notes SET memo = ?3 WHERE pool = ?1 AND nf = ?2")
+                        .bind(memo_note.pool)
                         .bind(memo_note.nf.as_slice())
                         .bind(&memo_note.memo)
                         .execute(&mut *db_tx)
@@ -719,6 +838,10 @@ impl Db {
     pub fn ufvk(&self) -> &UnifiedFullViewingKey {
         &self.ufvk
     }
+
+    pub async fn lock_scan(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.scan_lock.lock().await
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +868,24 @@ mod tests {
         memo TEXT,
         spent INTEGER,
         CONSTRAINT tx_output UNIQUE (position))";
+
+    const PR63_DDL: &str = "CREATE TABLE received_notes (
+        id_note INTEGER PRIMARY KEY,
+        address TEXT NOT NULL,
+        account INTEGER,
+        sub_account INTEGER,
+        id_tx INTEGER NOT NULL,
+        pool INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        diversifier BLOB NOT NULL,
+        value INTEGER NOT NULL,
+        rcm BLOB NOT NULL,
+        nf BLOB NOT NULL UNIQUE,
+        rho BLOB,
+        memo TEXT,
+        spent INTEGER,
+        CONSTRAINT tx_output UNIQUE (pool, position))";
 
     async fn insert_legacy_note(
         connection: &mut SqliteConnection,
@@ -775,8 +916,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO received_notes
             (address, account, sub_account, id_tx, pool, position, height,
-            diversifier, value, rcm, nf, rho, memo, spent)
-            VALUES ('addr',0,0,1,?1,?2,100,x'00',1000,x'00',?3,NULL,'',0)",
+            diversifier, value, rcm, nf, rho, memo, spent_height)
+            VALUES ('addr',0,0,1,?1,?2,100,x'00',1000,x'00',?3,NULL,'',NULL)",
         )
         .bind(pool)
         .bind(position)
@@ -800,7 +941,7 @@ mod tests {
         insert_legacy_note(&mut connection, 7, b"sapling-nf", None).await?;
         insert_legacy_note(&mut connection, 9, b"orchard-nf", Some(b"rho")).await?;
 
-        Db::migrate_received_notes_pool(&mut connection).await?;
+        assert!(Db::migrate_received_notes_pool(&mut connection).await?);
 
         let pools: Vec<(Vec<u8>, u8)> = sqlx::query("SELECT nf, pool FROM received_notes")
             .map(|r: SqliteRow| (r.get(0), r.get(1)))
@@ -816,6 +957,7 @@ mod tests {
 
         // An Ironwood note at a position already used by another pool is now accepted...
         insert_note(&mut connection, POOL_IRONWOOD, 7, b"ironwood-nf").await?;
+        insert_note(&mut connection, POOL_SAPLING, 8, b"ironwood-nf").await?;
         // ...while a genuine duplicate within one pool is still rejected.
         assert!(
             insert_note(&mut connection, POOL_IRONWOOD, 7, b"ironwood-nf-2")
@@ -824,11 +966,181 @@ mod tests {
         );
 
         // Re-running the migration is a no-op.
-        Db::migrate_received_notes_pool(&mut connection).await?;
+        assert!(!Db::migrate_received_notes_pool(&mut connection).await?);
         let (count,): (u32,) = sqlx::query_as("SELECT COUNT(*) FROM received_notes")
             .fetch_one(&mut connection)
             .await?;
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr63_upgrade_rewinds_once_and_preserves_replay_state() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "zcash-walletd-pr63-upgrade-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &Network::Main,
+            &[0; 32],
+            zip32::AccountId::ZERO,
+        )?
+        .to_unified_full_viewing_key();
+        let db = Db::new(Network::Main, &path.to_string_lossy(), &ufvk, "").await?;
+        let activation_height = u32::from(
+            Network::Main
+                .activation_height(NetworkUpgrade::Nu6_3)
+                .unwrap(),
+        );
+        let rewind_height = activation_height - 1;
+
+        {
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query(PR63_DDL).execute(&mut *connection).await?;
+            sqlx::query("CREATE TABLE blocks (height INTEGER PRIMARY KEY, hash BLOB NOT NULL)")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query(
+                "CREATE TABLE addresses (
+                    id_address INTEGER PRIMARY KEY, label TEXT NOT NULL,
+                    account INTEGER NOT NULL, sub_account INTEGER NOT NULL,
+                    address TEXT NOT NULL, diversifier_index INTEGER NOT NULL)",
+            )
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "CREATE TABLE transactions (
+                    id_tx INTEGER PRIMARY KEY, txid BLOB NOT NULL UNIQUE,
+                    height INTEGER NOT NULL, value INTEGER NOT NULL)",
+            )
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query("INSERT INTO addresses VALUES (1, '', 0, 0, 'addr', 0)")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("INSERT INTO blocks VALUES (?1, x'01'), (?2, x'02')")
+                .bind(rewind_height)
+                .bind(activation_height + 10)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query(
+                "INSERT INTO transactions VALUES
+                    (1, x'01', ?1, 1000), (2, x'02', ?2, 2000)",
+            )
+            .bind(rewind_height - 1)
+            .bind(activation_height + 5)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO received_notes
+                (address, account, sub_account, id_tx, pool, position, height,
+                diversifier, value, rcm, nf, rho, memo, spent)
+                VALUES
+                ('addr',0,0,1,2,7,?1,x'00',1000,x'00',
+                    x'0101010101010101010101010101010101010101010101010101010101010101',
+                    x'02','',1),
+                ('addr',0,0,2,3,8,?2,x'00',2000,x'00',
+                    x'0303030303030303030303030303030303030303030303030303030303030303',
+                    x'04','',0)",
+            )
+            .bind(rewind_height - 1)
+            .bind(activation_height + 5)
+            .execute(&mut *connection)
+            .await?;
+        }
+
+        assert_eq!(db.create().await?, (true, true));
+        assert_eq!(db.get_nfs().await?.len(), 2);
+
+        let canonical_hash = [9; 32];
+        db.rewind_for_ironwood(rewind_height, &canonical_hash)
+            .await?;
+
+        let mut connection = db.pool.acquire().await?;
+        let blocks: Vec<(u32, Vec<u8>)> = sqlx::query("SELECT height, hash FROM blocks")
+            .map(|row: SqliteRow| (row.get(0), row.get(1)))
+            .fetch_all(&mut *connection)
+            .await?;
+        assert_eq!(blocks, vec![(rewind_height, canonical_hash.to_vec())]);
+        let transactions: Vec<(u32, i64)> =
+            sqlx::query("SELECT height, value FROM transactions ORDER BY id_tx")
+                .map(|row: SqliteRow| (row.get(0), row.get(1)))
+                .fetch_all(&mut *connection)
+                .await?;
+        assert_eq!(
+            transactions,
+            vec![(rewind_height - 1, 1000), (activation_height + 5, 0)]
+        );
+        let notes: Vec<(u8, u32, Option<u32>)> =
+            sqlx::query("SELECT pool, height, spent_height FROM received_notes ORDER BY id_note")
+                .map(|row: SqliteRow| (row.get(0), row.get(1), row.get(2)))
+                .fetch_all(&mut *connection)
+                .await?;
+        assert_eq!(notes, vec![(POOL_ORCHARD, rewind_height - 1, Some(0))]);
+        drop(connection);
+
+        assert_eq!(db.create().await?, (true, false));
+        assert_eq!(db.get_nfs().await?.len(), 1);
+
+        db.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reorg_rewinds_to_an_existing_checkpoint_atomically() -> Result<()> {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await?;
+        sqlx::query("CREATE TABLE blocks (height INTEGER PRIMARY KEY, hash BLOB NOT NULL)")
+            .execute(&mut connection)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE transactions (
+                id_tx INTEGER PRIMARY KEY, txid BLOB NOT NULL UNIQUE,
+                height INTEGER NOT NULL, value INTEGER NOT NULL)",
+        )
+        .execute(&mut connection)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE received_notes (
+                id_note INTEGER PRIMARY KEY, height INTEGER NOT NULL, spent_height INTEGER)",
+        )
+        .execute(&mut connection)
+        .await?;
+        sqlx::query("INSERT INTO blocks VALUES (100, x'01'), (200, x'02')")
+            .execute(&mut connection)
+            .await?;
+        sqlx::query(
+            "INSERT INTO transactions VALUES
+                (1, x'01', 90, 1), (2, x'02', 120, 1)",
+        )
+        .execute(&mut connection)
+        .await?;
+        sqlx::query(
+            "INSERT INTO received_notes VALUES
+                (1, 90, 120), (2, 120, NULL)",
+        )
+        .execute(&mut connection)
+        .await?;
+
+        assert_eq!(Db::truncate_to_checkpoint(&mut connection, 150).await?, 100);
+        let (block_height,): (u32,) = sqlx::query_as("SELECT MAX(height) FROM blocks")
+            .fetch_one(&mut connection)
+            .await?;
+        assert_eq!(block_height, 100);
+        let transactions: Vec<u32> = sqlx::query("SELECT height FROM transactions")
+            .map(|row: SqliteRow| row.get(0))
+            .fetch_all(&mut connection)
+            .await?;
+        assert_eq!(transactions, vec![90]);
+        let notes: Vec<(u32, Option<u32>)> =
+            sqlx::query("SELECT height, spent_height FROM received_notes")
+                .map(|row: SqliteRow| (row.get(0), row.get(1)))
+                .fetch_all(&mut connection)
+                .await?;
+        assert_eq!(notes, vec![(90, None)]);
+        assert_eq!(Db::truncate_to_checkpoint(&mut connection, 50).await?, 100);
 
         Ok(())
     }

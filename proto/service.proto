@@ -31,8 +31,8 @@ enum PoolType {
 // compact blocks. It is part of the *versioned* lightwallet-protocol
 // (https://github.com/zcash/lightwallet-protocol): a client MUST verify that the server
 // advertises a non-empty `LightdInfo.lightwalletProtocolVersion` before setting it, because
-// a legacy server may reject it or silently misinterpret tag 3. Leave it empty for the
-// legacy default (Sapling + Orchard only).
+// a legacy server may reject it or silently misinterpret tag 3. Leave it empty to request
+// the default shielded pools (Sapling, Orchard, and Ironwood).
 message BlockRange {
     BlockID start = 1;
     BlockID end = 2;
@@ -91,8 +91,7 @@ message LightdInfo {
     string upgradeName = 16;            // name of next pending network upgrade, empty if none scheduled
     uint64 upgradeHeight = 17;          // height of next pending upgrade, zero if none is scheduled
     // Version of https://github.com/zcash/lightwallet-protocol served by this server.
-    // Empty on legacy (<= v0.4.x) servers; a non-empty value is what gates `BlockRange.poolTypes`
-    // (and hence Ironwood data in compact blocks).
+    // Empty on legacy servers and some v0.5 implementations.
     string lightwalletProtocolVersion = 18;
 }
 

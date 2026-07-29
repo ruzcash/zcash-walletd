@@ -47,10 +47,14 @@ struct Args {
 // pub const NOTIFY_TX_URL: &str = "https://localhost:14142/zcashlikedaemoncallback/tx?cryptoCode=yec&hash=";
 
 use crate::{
-    db::Db, lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient, monitor::monitor_task,
+    db::Db,
+    lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient,
+    monitor::monitor_task,
+    scan::{get_latest_height, verify_lightwalletd_capability},
 };
 use serde::Deserialize;
 use zcash_client_backend::keys::UnifiedFullViewingKey;
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 #[derive(Deserialize, Debug)]
 pub struct WalletConfig {
@@ -105,12 +109,33 @@ async fn main() -> Result<()> {
     let birth_height = config.birth_height;
     let ufvk = UnifiedFullViewingKey::decode(&network, ufvk)
         .map_err(|_| anyhow!("Invalid Unified Viewing Key"))?;
+    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone()).await?;
+    let tip = get_latest_height(&mut client).await?;
+    verify_lightwalletd_capability(&network, &mut client, tip).await?;
+
     let db = Db::new(network, &config.db_path, &ufvk, &config.notify_tx_url).await?;
-    let db_exists = db.create().await?;
+    let (db_exists, ironwood_replay_pending) = db.create().await?;
     if !db_exists {
         db.new_account("").await?;
     }
-    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone()).await?;
+
+    if ironwood_replay_pending {
+        match network.activation_height(NetworkUpgrade::Nu6_3) {
+            Some(activation_height) => {
+                let activation_height = u32::from(activation_height);
+                if db.get_synced_height().await? >= activation_height {
+                    let rewind_height = birth_height.max(activation_height.saturating_sub(1));
+                    let rewind_hash =
+                        Db::fetch_canonical_block_hash(&mut client, rewind_height).await?;
+                    db.rewind_for_ironwood(rewind_height, &rewind_hash).await?;
+                    info!("Rewound wallet scan to {rewind_height} for Ironwood activation");
+                } else {
+                    db.complete_ironwood_replay().await?;
+                }
+            }
+            None => db.complete_ironwood_replay().await?,
+        }
+    }
     db.fetch_block_hash(&mut client, birth_height).await?;
 
     monitor_task(config.port, config.poll_interval).await;
